@@ -4,7 +4,11 @@
 
 ## 1. 입력과 출력
 
-하나의 자식 BC1 블록을 만들기 위한 입력은 이전 mip level의 2×2 부모 BC1 블록이다.
+현재 구현에는 자식 BC1 블록을 만드는 경로가 두 개 있고, 두 경로는 뒷부분의 encoder core를 공유한다.
+
+### 경로 A: symbolic 경로 (`ProcessRowBC1()`, mip 1 전용)
+
+입력은 이전 mip level의 2×2 부모 BC1 블록이다.
 
 ```text
 p00  p10
@@ -16,8 +20,17 @@ p01  p11
 - 각 부모 블록 내부를 2×2 texel quadrant 네 개로 나눈다.
 - 총 16개의 quadrant 평균을 구하면, 이것들이 자식 블록의 4×4 texel 16개가 된다.
 - 출력은 이 16개 값을 근사하여 인코딩한 BC1 블록 하나이다.
+- 부수적으로 각 부모 블록의 4×4 linear RGB 평균을 block-mean image $M$에 기록한다.
 
-CPU 경로에서는 서로 독립적인 자식 블록 네 개를 `uint4`/`float4`의 `x`, `y`, `z`, `w` lane에 넣고 같은 연산을 수행한다. 현재 CPU의 `uint4`와 `float4`는 실제 SIMD intrinsic이 아니라 4-lane 형태의 scalar 연산이다.
+### 경로 B: linear 경로 (`ProcessLinearRowBC1()`, mip 2 이상)
+
+입력은 압축 블록이 아니라 linear RGB mean image이다. 이 image의 texel 격자는 생성하려는 mip level의 texel 격자와 1:1로 일치한다.
+
+- 자식 블록 하나의 4×4 texel을 mean image에서 그대로 읽어온다.
+- 범위를 벗어나는 좌표는 clamp-to-edge로 읽는다.
+- 출력은 경로 A와 동일한 BC1 블록 하나이다.
+
+두 경로 모두 CPU에서는 서로 독립적인 자식 블록 네 개를 `uint4`/`float4`의 `x`, `y`, `z`, `w` lane에 넣고 같은 연산을 수행한다. 현재 CPU의 `uint4`와 `float4`는 실제 SIMD intrinsic이 아니라 4-lane 형태의 scalar 연산이다.
 
 ## 2. 사용 데이터 타입
 
@@ -39,6 +52,8 @@ CPU 경로에서는 서로 독립적인 자식 블록 네 개를 `uint4`/`float4
 
 CPU에서 `uint4`와 `float4`는 연산자 overload를 가진 scalar 구조체다. Slang에서는 같은 이름의 native vector type을 사용한다. `INOUT`, `OUT`, `SHARED_INLINE` macro는 함수 본문을 공유하기 위한 함수 인자 및 inline 표기 차이만 흡수한다.
 
+CPU 경로에는 sRGB 8-bit code value를 linear로 바꾸는 256개짜리 lookup table `kSrgb8ToLinear`가 있다. Slang 경로에서는 같은 변환을 해석적으로 계산한다.
+
 ### 2.2 BC1 block 타입
 
 ```cpp
@@ -58,7 +73,7 @@ struct SymbolicDataBC1
 | `color_1` | 16 bit | 두 번째 RGB565 endpoint |
 | `selectors` | 32 bit | 4×4 texel의 2-bit selector 16개 |
 
-`src_blocks`와 `dst_blocks`는 외부에서는 `uint8_t*` byte buffer로 전달되고, `ProcessRowBC1()` 안에서 `SymbolicDataBC1*`로 해석된다.
+`src_blocks`와 `dst_blocks`는 외부에서는 `uint8_t*` byte buffer로 전달되고, `ProcessRowBC1()`과 `ProcessLinearRowBC1()` 안에서 `SymbolicDataBC1*`로 해석된다.
 
 ### 2.3 4-lane BC1 block 타입
 
@@ -106,7 +121,14 @@ struct QuadrantMeans
 };
 ```
 
-`QuadrantMeans`는 부모 BC1 block 하나를 구성하는 네 개 2×2 quadrant의 linear RGB 평균을 저장한다. 구조체 하나가 lane별 부모 block 네 개를 표현하므로, `p00`, `p10`, `p01`, `p11` 각각에 대해 하나씩 생성된다.
+`QuadrantMeans`는 자식 블록의 2×2 texel 그룹 하나에 들어가는 네 값을 저장한다. `p00`, `p10`, `p01`, `p11` 네 개가 모여 자식 블록의 4×4 texel 16개를 이룬다.
+
+두 경로에서 내용의 의미가 다르다.
+
+- 경로 A에서는 각 값이 부모 BC1 블록 한 개의 2×2 quadrant를 linear RGB로 평균한 값이다.
+- 경로 B에서는 각 값이 mean image에서 읽어온 texel 값 그 자체다.
+
+구조체 하나가 lane별로 네 작업을 표현하므로 두 경로 모두 네 개의 `QuadrantMeans`를 사용한다.
 
 ### 2.6 Covariance 타입
 
@@ -138,9 +160,32 @@ struct ParentStatistics
 };
 ```
 
-`ParentStatistics`는 한 부모 위치에 묶인 네 lane 각각에 대해 quadrant 네 개의 평균과 within-parent covariance를 저장한다. 이 값 네 세트가 이후 ANOVA의 between-parent/within-parent 결합에 사용된다.
+`ParentStatistics`는 한 그룹에 묶인 네 lane 각각에 대해 값 네 개의 평균과 within-group covariance를 저장한다. 이 값 네 세트가 이후 ANOVA의 between/within 결합에 사용된다.
 
-### 2.8 중간 histogram과 endpoint 값
+### 2.8 Block mean 타입
+
+```cpp
+struct BlockMeans
+{
+    float4 r, g, b;
+};
+
+struct LinearBlockMean
+{
+    float r, g, b;
+};
+
+struct SourceBlockMeans
+{
+    BlockMeans p00, p10, p01, p11;
+};
+```
+
+- `BlockMeans`는 4-lane 형태의 block 평균이다. 네 lane 각각이 서로 다른 source block 하나의 linear RGB 평균을 담는다.
+- `LinearBlockMean`은 같은 값을 lane 없이 scalar 세 개로 저장한 형태다. block-mean image $M$의 texel 타입이며 12 byte이다.
+- `SourceBlockMeans`는 자식 블록 그룹 하나를 만드는 데 사용된 source block 네 개(`p00`, `p10`, `p01`, `p11`)의 평균을 한꺼번에 담는다. `ComputeChildBlockMoments()`가 이미 계산하는 중간값을 밖으로 내보내기 위한 출력 전용 구조체다.
+
+### 2.9 중간 histogram과 endpoint 값
 
 selector histogram 전용 구조체는 사용하지 않는다. `Extract2x2SelectorHistograms()`의 출력 네 개를 각각 `uint4`로 유지한다.
 
@@ -164,37 +209,45 @@ PCA와 least-squares 단계의 평균, 축, endpoint도 별도 RGB vector 구조
 
 ## 3. 전체 처리 순서
 
+두 경로는 자식 texel 16개를 만드는 앞부분만 다르고, 그 이후 encoder core는 완전히 같다.
+
 ```text
-2×2 부모 BC1 블록 수집
-    ↓
-독립적인 작업 4개를 lane 단위로 묶기
-    ↓
-부모 selector를 2×2 quadrant histogram으로 집계
-    ↓
-RGB565 endpoint로 BC1 hardware palette 생성
-    ↓
-palette의 각 색을 sRGB에서 linear RGB로 변환
-    ↓
-histogram과 linear palette로 16개 자식 texel 평균 계산
-    ↓
-ANOVA 방식으로 전체 평균과 covariance 계산
-    ↓
-PCA로 초기 endpoint 추정
-    ↓
-discrete selector를 사용한 least-squares endpoint 보정
-    ↓
-고정 4/9 chord-curve 보정
-    ↓
-linear endpoint를 sRGB로 변환하고 RGB565로 양자화
-    ↓
-양자화된 endpoint로 hardware palette 재생성
-    ↓
-16개 자식 texel에 가장 가까운 selector 재할당
-    ↓
-BC1 block으로 pack하고 출력
+[경로 A: mip 1]                       [경로 B: mip 2 이상]
+2×2 부모 BC1 블록 수집                  linear mean image 준비
+    ↓                                      ↓
+부모 selector를 quadrant histogram으로     자식 texel 좌표로 clamp fetch
+    ↓                                      ↓
+RGB565 endpoint로 hardware palette 생성    ─
+    ↓                                      ↓
+palette를 sRGB에서 linear RGB로 변환       ─
+    ↓                                      ↓
+histogram과 linear palette로 16개          16개 자식 texel 확보
+자식 texel 평균 계산                        ↓
+    ↓                                      │
+block-mean image M에 부모 평균 기록          │
+    └──────────────┬───────────────────────┘
+                   ↓
+        [공통 encoder core]
+        ANOVA 방식으로 전체 평균과 covariance 계산
+                   ↓
+        PCA로 초기 endpoint 추정
+                   ↓
+        discrete selector를 사용한 least-squares endpoint 보정
+                   ↓
+        고정 4/9 chord-curve 보정
+                   ↓
+        linear endpoint를 sRGB로 변환하고 RGB565로 양자화
+                   ↓
+        strict opaque 조건(color0 > color1) 강제
+                   ↓
+        양자화된 endpoint로 hardware palette 재생성
+                   ↓
+        16개 자식 texel에 가장 가까운 selector 재할당
+                   ↓
+        BC1 block으로 pack하고 출력
 ```
 
-## 4. 부모 블록 수집
+## 4. 경로 A: 부모 블록 수집
 
 `ProcessRowBC1()`은 자식 블록 좌표 `(x, y)`에 대해 이전 mip level에서 다음 네 부모 블록을 읽는다.
 
@@ -205,7 +258,7 @@ p01 = source(2x,     2y + 1)
 p11 = source(2x + 1, 2y + 1)
 ```
 
-source block 범위를 넘어가는 좌표는 마지막 유효 block 좌표로 clamp한다. 한 번의 encoder 호출에는 최대 네 개의 자식 블록 작업을 모아 각 lane에 배치한다. 마지막 묶음에서 실제 작업 수가 네 개보다 적으면 유효한 lane만 출력한다.
+source block 범위를 넘어가는 좌표는 마지막 유효 block 좌표로 clamp한다. 한 번의 encoder 호출에는 최대 네 개의 자식 블록 작업을 모아 각 lane에 배치한다. 마지막 묶음에서 실제 작업 수가 네 개보다 적으면 남은 lane은 마지막 유효 작업을 복제해 채우고, 출력은 유효한 lane만 저장한다.
 
 ## 5. 부모 selector의 quadrant histogram 계산
 
@@ -272,36 +325,79 @@ p01.q2 p01.q3 p11.q2 p11.q3
 
 따라서 mip downsampling 자체는 sRGB code value의 평균이 아니라 **linear RGB 평균**으로 수행된다.
 
-## 8. ANOVA 방식의 평균과 covariance 계산
+## 8. Block-mean image $M$ 생성
 
-`ComputeChildBlockMoments()`는 16개 자식 texel의 전체 평균과 covariance를 구한다. 현재 구현은 이를 부모별 within-parent 성분과 부모 사이의 between-parent 성분으로 나누어 계산한다.
-
-### 8.1 부모별 통계
-
-`ComputeParentStatistics()`가 한 부모에서 나온 quadrant 평균 네 개에 대해 다음 값을 계산한다.
+`ComputeBlockMeans()`는 한 부모 블록의 quadrant 평균 네 개를 다시 평균한다.
 
 ```text
-parent_mean = (q0 + q1 + q2 + q3) / 4
-within_covariance = 평균((qi - parent_mean)(qi - parent_mean)^T)
+block_mean = (q0 + q1 + q2 + q3) / 4
 ```
 
-### 8.2 전체 평균
+quadrant 평균이 각각 2×2 texel의 평균이므로, 이 값은 부모 블록 16개 texel 전체의 linear RGB 평균과 정확히 같다. 이 값은 ANOVA 단계에서 어차피 계산되는 중간값이므로 추가 연산 비용이 거의 없다.
 
-부모 네 개의 평균으로 자식 블록 전체 평균을 계산한다.
+`ComputeChildBlockMoments()`가 이 네 부모의 평균을 `SourceBlockMeans`로 밖에 내보내고, `ProcessRowBC1()`이 `StoreBlockMean()`으로 lane을 풀어 block-mean image $M$의 해당 source block 좌표에 기록한다. clamp 때문에 같은 좌표가 중복 지정되는 경우에는 한 번만 기록한다.
+
+$M$의 크기는 mip 0의 BC1 block grid와 같다.
+
+$$
+M_{width}=\left\lceil\frac{W}{4}\right\rceil,\qquad
+M_{height}=\left\lceil\frac{H}{4}\right\rceil
+$$
+
+$M$의 texel 하나가 원본 4×4 pixel 영역에 대응하므로, $M$의 격자는 mip 2의 texel 격자와 정확히 일치한다.
+
+## 9. 경로 B: linear mean image에서 자식 texel 구성
+
+`ProcessLinearRowBC1()`은 압축 블록을 전혀 읽지 않는다. 자식 블록 `(block_x, dst_row_y)`의 texel `(local_x, local_y)`에 대해 mean image 좌표를 직접 계산한다.
+
+```text
+target_x = block_x * 4 + local_x
+target_y = dst_row_y * 4 + local_y
+```
+
+`FetchLinearMeanTexel()`이 이 좌표를 image 범위로 clamp해서 읽는다. 읽은 값은 다음 규칙으로 `QuadrantMeans` 네 개에 배치된다.
+
+```text
+region = ((local_y >> 1) << 1) + (local_x >> 1)   → p00, p10, p01, p11 중 하나
+sample = ((local_y & 1) << 1) + (local_x & 1)     → q0, q1, q2, q3 중 하나
+```
+
+즉 자식 블록의 4×4 texel을 2×2 그룹 네 개로 나누고, 각 그룹을 경로 A의 부모 슬롯과 같은 자리에 넣는다. 덕분에 이후 encoder core는 두 경로를 구분할 필요가 없다.
+
+이 경로에서 `QuadrantMeans`의 값은 평균이 아니라 texel 값 자체이므로, 뒤따르는 ANOVA 분해는 16개 texel을 2×2 그룹 네 개로 나누어 계산하는 것과 같다. 결과 covariance는 16개 texel을 직접 사용해 계산한 값과 동일하다.
+
+lane 배치는 경로 A와 같지만, 유효하지 않은 lane은 채우지 않고 건너뛴다. `QuadrantMeans`는 `float4`의 기본 생성자가 0으로 채우므로 미사용 lane은 정의된 0 상태로 남고, 결과 저장 루프가 유효 lane만 기록하므로 출력에는 영향이 없다.
+
+## 10. ANOVA 방식의 평균과 covariance 계산
+
+`ComputeChildBlockMoments()`는 16개 자식 texel의 전체 평균과 covariance를 구한다. 현재 구현은 이를 그룹별 within 성분과 그룹 사이의 between 성분으로 나누어 계산한다.
+
+### 10.1 그룹별 통계
+
+`ComputeParentStatistics()`가 한 그룹에서 나온 값 네 개에 대해 다음을 계산한다.
+
+```text
+group_mean = (q0 + q1 + q2 + q3) / 4
+within_covariance = 평균((qi - group_mean)(qi - group_mean)^T)
+```
+
+### 10.2 전체 평균
+
+그룹 네 개의 평균으로 자식 블록 전체 평균을 계산한다.
 
 ```text
 mean = (mean00 + mean10 + mean01 + mean11) / 4
 ```
 
-### 8.3 Between-parent covariance
+### 10.3 Between covariance
 
-`AccumulateBetweenParentCovariance()`가 각 부모 평균과 전체 평균의 차이를 누적한다.
+`AccumulateBetweenParentCovariance()`가 각 그룹 평균과 전체 평균의 차이를 누적한다.
 
 ```text
-between = 평균((parent_mean - mean)(parent_mean - mean)^T)
+between = 평균((group_mean - mean)(group_mean - mean)^T)
 ```
 
-### 8.4 전체 covariance
+### 10.4 전체 covariance
 
 최종 covariance는 다음과 같다.
 
@@ -311,13 +407,13 @@ covariance = between + 평균(within_covariance)
 
 이 ANOVA 분해는 16개 자식 texel을 직접 사용해 계산한 전체 covariance와 수학적으로 같은 값을 다른 구조로 계산하는 것이다.
 
-## 9. PCA 기반 초기 endpoint 계산
+## 11. PCA 기반 초기 endpoint 계산
 
 `ComputeInitialEndpointsPCA()`는 covariance의 주성분 방향을 구한다.
 
 1. 초기 방향을 `(1/√3, 1/√3, 1/√3)`으로 설정한다.
-2. covariance에 대한 power iteration을 두 번 수행한다.
-3. 길이가 너무 작은 경우를 방지하기 위해 epsilon 처리를 한다.
+2. covariance에 대한 power iteration을 **한 번** 수행한다. (루프 상한이 `i < 1`이다. 함수 안의 주석은 두 번이라고 되어 있으나 실제 반복 횟수는 한 번이다.)
+3. 길이가 너무 작은 경우를 방지하기 위해 `1e-20` epsilon을 더한다.
 4. 16개 자식 texel을 주성분 축에 투영한다.
 5. 최소 투영값과 최대 투영값으로 초기 linear endpoint를 만든다.
 
@@ -328,7 +424,7 @@ p1 = mean + t_max × axis
 
 이 단계는 최종 BC1 endpoint를 확정하는 단계가 아니라, least-squares 최적화를 시작하기 위한 초기값을 정하는 단계이다.
 
-## 10. Least-squares endpoint 보정
+## 12. Least-squares endpoint 보정
 
 `OptimizeEndpointsLeastSquares()`는 현재 endpoint 선분에 각 자식 texel을 투영하고, 투영 위치를 BC1의 네 interpolation weight 중 가장 가까운 값으로 양자화한다.
 
@@ -345,13 +441,14 @@ predicted_color = a + w × d
 16개 자식 texel에 대해 `w`, `w²`, texel 색, `w × texel 색`을 누적한 뒤 2×2 normal equation을 풀어 `a`와 `d`를 갱신한다.
 
 ```text
-p0 = a
-p1 = a + d
+det = 16 × S2 - S1²
+p0  = a
+p1  = a + d
 ```
 
-행렬식이 너무 작아 안정적으로 풀 수 없으면 두 endpoint를 전체 평균으로 설정한다.
+행렬식이 `1e-6`보다 작아 안정적으로 풀 수 없으면 두 endpoint를 모두 전체 평균으로 설정한다.
 
-## 11. Chord-curve gap 보정
+## 13. Chord-curve gap 보정
 
 `CorrectChordCurveGap()`는 linear 공간에서 구한 직선 endpoint와 sRGB code-space에서 보간된 실제 BC1 palette 사이의 차이를 줄이기 위한 보정을 수행한다.
 
@@ -371,7 +468,7 @@ q1 = linear_to_sRGB(p1 + (4/9) × sigma)
 
 현재 `4/9` 계수는 BC1 4-color interpolation 위치가 균등하게 사용된다는 가정의 고정값이다. 실제 selector 분포에 따라 계수를 다시 계산하지는 않는다.
 
-## 12. RGB565 endpoint 양자화와 순서 정리
+## 14. RGB565 endpoint 양자화와 strict opaque 순서 강제
 
 `PackAndReallocateSelectors()`는 보정된 sRGB endpoint의 각 채널을 `[0, 1]`로 clamp한 뒤 RGB565로 반올림하여 pack한다.
 
@@ -381,9 +478,19 @@ G: 6 bit
 B: 5 bit
 ```
 
-그다음 `color0 >= color1`이 되도록 endpoint를 교환한다. 이는 opaque 4-color mode 방향을 의도한 처리이지만, endpoint가 같은 경우까지 `color0 > color1`을 강제하지는 않는다.
+그다음 opaque 4-color mode를 보장하기 위해 `color0 > color1`을 강제한다.
 
-## 13. 양자화된 palette 재생성과 selector 재할당
+```text
+if color0 == color1:
+    if (color1 & 0x1F) > 0:  color1 -= 1     # blue LSB 하나만 낮춤
+    else:                    color0 += 1     # blue LSB 하나만 높임
+elif color0 < color1:
+    swap(color0, color1)
+```
+
+두 endpoint가 같은 경우에도 blue 채널 LSB 하나만 조정하므로 색 이동이 최소이며, 결과는 항상 strict한 `color0 > color1`이 된다. CPU 경로는 lane별 분기로, Slang 경로는 `select()` 기반 branchless 연산으로 같은 규칙을 구현한다.
+
+## 15. 양자화된 palette 재생성과 selector 재할당
 
 endpoint 양자화가 끝나면 양자화 전의 endpoint나 이상적인 linear interpolation 결과를 selector 선택에 사용하지 않는다.
 
@@ -405,26 +512,49 @@ selector = argmin_k ||child_texel - linear_palette[k]||²
 32-bit selectors
 ```
 
-## 14. 네 lane 결과 출력
+## 16. 네 lane 결과 출력
 
-`EncodeMipBlocksBC1x4()`는 위 과정을 네 lane에 대해 함께 수행하고 `SymbolicDataBC1x4`를 반환한다. `ProcessRowBC1()`은 유효한 각 lane의 endpoint와 selector를 일반 BC1 block으로 꺼내 destination mip level에 저장한다.
+`EncodeLinearBlocksBC1x4()`가 공통 encoder core이고, `EncodeMipBlocksBC1x4()`는 그 앞에 경로 A의 histogram 및 palette 복원 단계를 붙인 wrapper이다. 두 함수 모두 `SymbolicDataBC1x4`를 반환한다. `ProcessRowBC1()`과 `ProcessLinearRowBC1()`은 유효한 각 lane의 endpoint와 selector를 일반 BC1 block으로 꺼내 destination mip level에 저장한다.
 
-## 15. 전체 mip chain에서의 사용 방식
+## 17. 전체 mip chain에서의 사용 방식
 
-현재 `CpuBackend::GenerateChain()`은 각 mip level을 순차적으로 생성한다.
+`CpuBackend::GenerateChain()`은 mip 1만 압축 블록에서 만들고, mip 2 이상은 linear mean image에서 만든다.
 
 ```text
-mip 0 BC1 blocks → mip 1 BC1 blocks
-mip 1 BC1 blocks → mip 2 BC1 blocks
-mip 2 BC1 blocks → mip 3 BC1 blocks
-...
+mip 0 BC1 blocks ─┬─ quadrant means ──> mip 1 BC1 blocks
+                  └─ block means M = T_2 ──> mip 2 BC1 blocks
+                                    └─ 1/2 ──> T_3 ──> mip 3 BC1 blocks
+                                               └─ 1/2 ──> T_4 ──> mip 4 ...
 ```
 
-즉, 각 level은 바로 이전에 생성된 압축 블록을 부모 입력으로 사용한다. 모든 상위 level을 원본 level 0 통계에서 직접 생성하는 방식은 현재 구현되어 있지 않으므로, 재인코딩 오차가 level을 따라 누적될 수 있다.
+mip 2 이상은 이전에 인코딩된 BC1 mip을 입력으로 사용하지 않으므로 재인코딩 오차가 level을 따라 누적되지 않는다.
 
-각 level에서는 destination block row를 작업 단위로 분배하고, 해당 level의 모든 row 작업이 끝난 뒤 destination을 다음 level의 source로 사용한다.
+### 17.1 Mean pyramid
 
-## 16. 현재 방법에서 정확한 부분과 근사인 부분
+level $L \ge 2$의 target texel은 원래 $M$을 $s_L = 2^{L-2}$ 크기의 box로 평균한 값으로 정의된다.
+
+$$
+T_L(x,y)=\frac{1}{s_L^2}
+\sum_{j=0}^{s_L-1}\sum_{i=0}^{s_L-1}
+M(s_Lx+i,\,s_Ly+j)
+$$
+
+linear domain의 box filter는 결합적이므로 이 값은 직전 level의 mean image를 2×2로 평균한 것과 같다.
+
+$$
+T_L(x,y)=\frac{1}{4}\sum_{j=0}^{1}\sum_{i=0}^{1} T_{L-1}(2x+i,\,2y+j),
+\qquad T_2 \equiv M
+$$
+
+현재 구현은 이 재귀식을 사용한다. `DownsampleLinearMeanRow()`가 mean image를 반으로 줄이고, `GenerateChain()`이 ping-pong buffer 두 개를 번갈아 쓴다. scratch buffer는 $M$의 1/4 크기면 이후 모든 level을 커버한다.
+
+이 방식으로 level당 비용이 상수에서 등비 감소로 바뀐다. 축소는 linear float domain에서만 일어나고 BC1 재인코딩을 거치지 않으므로, 오차 누적이 없다는 성질은 그대로 유지된다.
+
+### 17.2 작업 분배
+
+각 level에서는 destination block row를 작업 단위로 thread pool에 분배하고, 해당 level의 모든 row 작업이 끝난 뒤 다음 level로 넘어간다. mean image 축소도 같은 방식으로 row 단위 분배 후 동기화한다.
+
+## 18. 현재 방법에서 정확한 부분과 근사인 부분
 
 ### 현재 연산 모델 안에서 직접 계산되는 부분
 
@@ -432,42 +562,77 @@ mip 2 BC1 blocks → mip 3 BC1 blocks
 - RGB565 확장과 BC1 code-space 정수 palette 생성
 - palette별 sRGB-to-linear 변환
 - histogram을 이용한 linear 2×2 box-filter 평균
+- quadrant 평균 네 개에서 얻는 block 평균
 - ANOVA로 계산한 평균과 covariance
+- 2의 거듭제곱 해상도에서 mean pyramid와 단일 $s_L$ box mean의 동등성
 - 최종 양자화 endpoint에 대한 hardware palette 재생성
 - 고정된 endpoint에 대한 nearest-selector 선택
 
 ### 근사 또는 heuristic인 부분
 
-- 두 번의 power iteration으로 구하는 PCA 방향
+- 한 번의 power iteration으로 구하는 PCA 방향
 - discrete weight를 먼저 배정한 뒤 한 번 푸는 least-squares endpoint
 - 실제 selector 분포와 무관한 고정 `4/9` chord-curve 보정
 - continuous endpoint를 RGB565 격자로 반올림하는 양자화
-- 이전 mip의 재인코딩 결과를 다음 mip 입력으로 사용하는 recursive chain
+- endpoint가 같을 때 blue LSB 하나를 움직이는 strict opaque 보정
+- $M$이 원본 texel이 아니라 mip 0 BC1 양자화 결과에서 계산된 평균이라는 점
+- 경계에서 유효 texel 수에 따른 가중 평균이 아니라 clamp-to-edge로 처리하는 것
 
-## 17. 현재 구현의 범위와 남은 제한
+## 19. 현재 구현의 범위와 남은 제한
 
 - opaque BC1 4-color block만 가정한다.
 - BC1 3-color/transparent mode는 처리하지 않는다.
-- 출력 endpoint가 같은 경우 strict opaque 조건인 `color0 > color1`이 보장되지 않는다.
 - BC1 UNORM과 BC1 UNORM SRGB의 format metadata를 끝까지 구분하지 않는다.
-- 홀수 크기나 매우 작은 mip의 clamp는 실제 유효 texel 수에 따른 가중 평균이 아니라 경계 block 반복 방식이다.
-- 현재 mip chain은 level 0에서 직접 계산하지 않으므로 level별 오차가 누적될 수 있다.
+- mean pyramid와 단일 $s_L$ box mean의 동등성은 2의 거듭제곱 해상도에서만 성립한다. 중간 level에 홀수 폭이 생기면 edge clamp 가중치가 달라지므로 두 결과가 미세하게 갈릴 수 있다.
+- 홀수 크기나 매우 작은 mip의 clamp는 실제 유효 texel 수에 따른 가중 평균이 아니라 경계 texel 반복 방식이다.
+- `ProcessLinearRowBC1()`은 `SourceBlockMeans` 출력 인자를 채우지만 그 값을 사용하지 않는다. 경로 B에서는 필요 없는 출력이다.
+- 경로 A의 lane 채우기는 유효하지 않은 lane도 마지막 유효 작업을 복제해 계산한다. 경로 B와 달리 아직 skip하지 않는다.
+- `Lane()`과 `SetLane()`이 runtime index `switch`로 구현되어 있어 lane 추출/삽입이 벡터화되지 않는다.
 - CPU의 4-lane 자료형은 SIMD에 적합한 구조지만, 현재 구현 자체가 SSE/AVX intrinsic을 사용하는 것은 아니다.
 - BC3, BC4, BC5, BC7 encoder는 이 경로에 구현되어 있지 않다.
 
-## 18. 코드의 주요 함수 대응표
+## 20. 코드의 주요 함수 대응표
+
+### 경로별 진입점
 
 | 처리 단계 | 함수 |
 |---|---|
-| 부모 블록 수집, 4-lane 구성, 결과 저장 | `ProcessRowBC1()` |
-| 한 번의 4-lane BC1 mip encode | `EncodeMipBlocksBC1x4()` |
+| mip chain 전체 스케줄링, mean pyramid 관리 | `CpuBackend::GenerateChain()` |
+| 경로 A: 부모 블록 수집, 4-lane 구성, 결과 및 $M$ 저장 | `ProcessRowBC1()` |
+| 경로 B: mean image에서 자식 texel 구성, 결과 저장 | `ProcessLinearRowBC1()` |
+| mean image 2×2 축소 (한 row) | `DownsampleLinearMeanRow()` |
+| mean image clamp-to-edge fetch | `FetchLinearMeanTexel()` |
+
+### 경로 A 전용 단계
+
+| 처리 단계 | 함수 |
+|---|---|
+| histogram과 palette 복원을 포함한 4-lane encode | `EncodeMipBlocksBC1x4()` |
 | selector quadrant histogram | `Extract2x2SelectorHistograms()` |
+| 2×2 영역 SWAR 카운터 | `Count2x2Regions()` |
 | BC1 hardware palette와 linear 변환 | `BuildOpaqueLinearPaletteBC1()` |
 | 부모별 quadrant 평균 | `ComputeParentQuadrantMeans()` |
-| 부모별 평균과 within covariance | `ComputeParentStatistics()` |
+| quadrant 평균 네 개에서 block 평균 | `ComputeBlockMeans()` |
+| lane을 풀어 $M$에 기록 | `StoreBlockMean()` |
+
+### 공통 encoder core
+
+| 처리 단계 | 함수 |
+|---|---|
+| 자식 texel 16개에서 BC1 block으로 | `EncodeLinearBlocksBC1x4()` |
+| 그룹별 평균과 within covariance | `ComputeParentStatistics()` |
 | between covariance 누적 | `AccumulateBetweenParentCovariance()` |
-| 전체 평균과 ANOVA covariance | `ComputeChildBlockMoments()` |
+| 전체 평균, ANOVA covariance, source block 평균 출력 | `ComputeChildBlockMoments()` |
 | PCA 초기 endpoint | `ComputeInitialEndpointsPCA()` |
 | least-squares endpoint 보정 | `OptimizeEndpointsLeastSquares()` |
 | chord-curve gap 보정 | `CorrectChordCurveGap()` |
-| RGB565 양자화, selector 재할당, pack | `PackAndReallocateSelectors()` |
+| RGB565 양자화, strict opaque 강제, selector 재할당, pack | `PackAndReallocateSelectors()` |
+| texel 하나의 nearest selector | `AssignNearestSelector()`, `FindBestSelector()` |
+
+### CPU 보조
+
+| 처리 단계 | 함수 |
+|---|---|
+| scalar BC1 block 네 개를 4-lane으로 pack | `PackBlocks()` |
+| lane 값 읽기/쓰기 | `Lane()`, `SetLane()` |
+| 자식 texel을 `QuadrantMeans` 슬롯에 배치 | `SetQuadrantSample()` |

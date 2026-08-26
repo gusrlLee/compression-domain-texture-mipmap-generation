@@ -110,6 +110,33 @@ struct QuadrantMeans
     float4 q3_r, q3_g, q3_b;
 };
 
+// Linear RGB mean of four independent BC1 blocks 
+// Each vector lane corresponds to one source block 
+struct BlockMeans 
+{
+    float4 r;
+    float4 g;
+    float4 b;
+};
+
+// Linear RGB mean of one source BC1 block.
+struct LinearBlockMean
+{
+    float r;
+    float g;
+    float b;
+};
+
+// Linear RGB means of the four source blocks used to produce
+// one destination block group.
+struct SourceBlockMeans
+{
+    BlockMeans p00;
+    BlockMeans p10;
+    BlockMeans p01;
+    BlockMeans p11;
+};
+
 // Structure to hold the symmetric 3x3 covariance matrix components
 struct CovarianceMatrix
 {
@@ -303,6 +330,17 @@ SHARED_INLINE void Extract2x2SelectorHistograms(
     hist_11 = Count2x2Regions(flag_11);
 }
 
+// The mean of the four 2x2 quadrants is exactly the mean
+// of all sixteen texels in the source BC1 block.
+SHARED_INLINE BlockMeans ComputeBlockMeans(QuadrantMeans quadrants)
+{
+    BlockMeans means;
+    means.r = (quadrants.q0_r + quadrants.q1_r + quadrants.q2_r + quadrants.q3_r) * 0.25f;
+    means.g = (quadrants.q0_g + quadrants.q1_g + quadrants.q2_g + quadrants.q3_g) * 0.25f;
+    means.b = (quadrants.q0_b + quadrants.q1_b + quadrants.q2_b + quadrants.q3_b) * 0.25f;
+    return means;
+}
+
 // ============================================================================
 // sRGB -> Linear
 // ============================================================================
@@ -432,9 +470,10 @@ SHARED_INLINE void ComputeParentQuadrantMeans(
 SHARED_INLINE ParentStatistics ComputeParentStatistics(QuadrantMeans parent)
 {
     ParentStatistics statistics;
-    statistics.mean_r = (parent.q0_r + parent.q1_r + parent.q2_r + parent.q3_r) * 0.25f;
-    statistics.mean_g = (parent.q0_g + parent.q1_g + parent.q2_g + parent.q3_g) * 0.25f;
-    statistics.mean_b = (parent.q0_b + parent.q1_b + parent.q2_b + parent.q3_b) * 0.25f;
+    BlockMeans block_means = ComputeBlockMeans(parent);
+    statistics.mean_r = block_means.r;
+    statistics.mean_g = block_means.g;
+    statistics.mean_b = block_means.b;
 
     float4 d0_r = parent.q0_r - statistics.mean_r;
     float4 d0_g = parent.q0_g - statistics.mean_g;
@@ -478,6 +517,7 @@ SHARED_INLINE void AccumulateBetweenParentCovariance(
 SHARED_INLINE void ComputeChildBlockMoments(
     QuadrantMeans p00, QuadrantMeans p10,
     QuadrantMeans p01, QuadrantMeans p11,
+    OUT(SourceBlockMeans) source_means,
     OUT(float4) mean_r, OUT(float4) mean_g, OUT(float4) mean_b,
     OUT(CovarianceMatrix) cov)
 {
@@ -485,6 +525,22 @@ SHARED_INLINE void ComputeChildBlockMoments(
     ParentStatistics stats10 = ComputeParentStatistics(p10);
     ParentStatistics stats01 = ComputeParentStatistics(p01);
     ParentStatistics stats11 = ComputeParentStatistics(p11);
+
+    source_means.p00.r = stats00.mean_r;
+    source_means.p00.g = stats00.mean_g;
+    source_means.p00.b = stats00.mean_b;
+
+    source_means.p10.r = stats10.mean_r;
+    source_means.p10.g = stats10.mean_g;
+    source_means.p10.b = stats10.mean_b;
+
+    source_means.p01.r = stats01.mean_r;
+    source_means.p01.g = stats01.mean_g;
+    source_means.p01.b = stats01.mean_b;
+
+    source_means.p11.r = stats11.mean_r;
+    source_means.p11.g = stats11.mean_g;
+    source_means.p11.b = stats11.mean_b;
 
     mean_r = (stats00.mean_r + stats10.mean_r + stats01.mean_r + stats11.mean_r) * 0.25f;
     mean_g = (stats00.mean_g + stats10.mean_g + stats01.mean_g + stats11.mean_g) * 0.25f;
@@ -905,65 +961,222 @@ SHARED_INLINE void PackAndReallocateSelectors(
     AssignNearestSelector(15, p11.q3_r, p11.q3_g, p11.q3_b, palette, out_selectors);
 }
 
-// Encodes four destination blocks in parallel. Every lane consumes one 2x2
-// group of parent BC1 blocks.
+// Encode four groups of 4x4 linear RGB samples into four BC1 blocks.
+SHARED_INLINE SymbolicDataBC1x4 EncodeLinearBlocksBC1x4(
+    QuadrantMeans p00_means,
+    QuadrantMeans p10_means,
+    QuadrantMeans p01_means,
+    QuadrantMeans p11_means,
+    OUT(SourceBlockMeans) source_means)
+{
+    float4 mean_r, mean_g, mean_b;
+    CovarianceMatrix covariance;
+
+    ComputeChildBlockMoments(
+        p00_means,
+        p10_means,
+        p01_means,
+        p11_means,
+        source_means,
+        mean_r,
+        mean_g,
+        mean_b,
+        covariance);
+
+    float4 p0_r, p0_g, p0_b;
+    float4 p1_r, p1_g, p1_b;
+
+    ComputeInitialEndpointsPCA(
+        covariance,
+        mean_r,
+        mean_g,
+        mean_b,
+        p00_means,
+        p10_means,
+        p01_means,
+        p11_means,
+        p0_r,
+        p0_g,
+        p0_b,
+        p1_r,
+        p1_g,
+        p1_b);
+
+    float4 optimized_p0_r, optimized_p0_g, optimized_p0_b;
+    float4 optimized_p1_r, optimized_p1_g, optimized_p1_b;
+
+    OptimizeEndpointsLeastSquares(
+        p00_means,
+        p10_means,
+        p01_means,
+        p11_means,
+        mean_r,
+        mean_g,
+        mean_b,
+        p0_r,
+        p0_g,
+        p0_b,
+        p1_r,
+        p1_g,
+        p1_b,
+        optimized_p0_r,
+        optimized_p0_g,
+        optimized_p0_b,
+        optimized_p1_r,
+        optimized_p1_g,
+        optimized_p1_b);
+
+    float4 corrected_p0_r, corrected_p0_g, corrected_p0_b;
+    float4 corrected_p1_r, corrected_p1_g, corrected_p1_b;
+
+    CorrectChordCurveGap(
+        optimized_p0_r,
+        optimized_p0_g,
+        optimized_p0_b,
+        optimized_p1_r,
+        optimized_p1_g,
+        optimized_p1_b,
+        corrected_p0_r,
+        corrected_p0_g,
+        corrected_p0_b,
+        corrected_p1_r,
+        corrected_p1_g,
+        corrected_p1_b);
+
+    SymbolicDataBC1x4 result;
+
+    PackAndReallocateSelectors(
+        corrected_p0_r,
+        corrected_p0_g,
+        corrected_p0_b,
+        corrected_p1_r,
+        corrected_p1_g,
+        corrected_p1_b,
+        p00_means,
+        p10_means,
+        p01_means,
+        p11_means,
+        result.color_0,
+        result.color_1,
+        result.selectors);
+
+    return result;
+}
+
 SHARED_INLINE SymbolicDataBC1x4 EncodeMipBlocksBC1x4(
-    SymbolicDataBC1x4 p00, SymbolicDataBC1x4 p10,
-    SymbolicDataBC1x4 p01, SymbolicDataBC1x4 p11)
+    SymbolicDataBC1x4 p00,
+    SymbolicDataBC1x4 p10,
+    SymbolicDataBC1x4 p01,
+    SymbolicDataBC1x4 p11,
+    OUT(SourceBlockMeans) source_means)
 {
     uint4 p00_hist0, p00_hist1, p00_hist2, p00_hist3;
     uint4 p10_hist0, p10_hist1, p10_hist2, p10_hist3;
     uint4 p01_hist0, p01_hist1, p01_hist2, p01_hist3;
     uint4 p11_hist0, p11_hist1, p11_hist2, p11_hist3;
 
-    Extract2x2SelectorHistograms(p00.selectors, p00_hist0, p00_hist1, p00_hist2, p00_hist3);
-    Extract2x2SelectorHistograms(p10.selectors, p10_hist0, p10_hist1, p10_hist2, p10_hist3);
-    Extract2x2SelectorHistograms(p01.selectors, p01_hist0, p01_hist1, p01_hist2, p01_hist3);
-    Extract2x2SelectorHistograms(p11.selectors, p11_hist0, p11_hist1, p11_hist2, p11_hist3);
+    Extract2x2SelectorHistograms(
+        p00.selectors,
+        p00_hist0,
+        p00_hist1,
+        p00_hist2,
+        p00_hist3);
 
-    QuadrantMeans p00_means, p10_means, p01_means, p11_means;
-    ComputeParentQuadrantMeans(p00.color_0, p00.color_1, p00_hist0, p00_hist1, p00_hist2, p00_hist3, p00_means);
-    ComputeParentQuadrantMeans(p10.color_0, p10.color_1, p10_hist0, p10_hist1, p10_hist2, p10_hist3, p10_means);
-    ComputeParentQuadrantMeans(p01.color_0, p01.color_1, p01_hist0, p01_hist1, p01_hist2, p01_hist3, p01_means);
-    ComputeParentQuadrantMeans(p11.color_0, p11.color_1, p11_hist0, p11_hist1, p11_hist2, p11_hist3, p11_means);
+    Extract2x2SelectorHistograms(
+        p10.selectors,
+        p10_hist0,
+        p10_hist1,
+        p10_hist2,
+        p10_hist3);
 
-    float4 mean_r, mean_g, mean_b;
-    CovarianceMatrix covariance;
-    ComputeChildBlockMoments(p00_means, p10_means, p01_means, p11_means, mean_r, mean_g, mean_b, covariance);
+    Extract2x2SelectorHistograms(
+        p01.selectors,
+        p01_hist0,
+        p01_hist1,
+        p01_hist2,
+        p01_hist3);
 
-    float4 p0_r, p0_g, p0_b, p1_r, p1_g, p1_b;
-    ComputeInitialEndpointsPCA(covariance, mean_r, mean_g, mean_b,
-                               p00_means, p10_means, p01_means, p11_means,
-                               p0_r, p0_g, p0_b, p1_r, p1_g, p1_b);
+    Extract2x2SelectorHistograms(
+        p11.selectors,
+        p11_hist0,
+        p11_hist1,
+        p11_hist2,
+        p11_hist3);
 
-    float4 optimized_p0_r, optimized_p0_g, optimized_p0_b;
-    float4 optimized_p1_r, optimized_p1_g, optimized_p1_b;
-    OptimizeEndpointsLeastSquares(
-        p00_means, p10_means, p01_means, p11_means,
-        mean_r, mean_g, mean_b,
-        p0_r, p0_g, p0_b, p1_r, p1_g, p1_b,
-        optimized_p0_r, optimized_p0_g, optimized_p0_b,
-        optimized_p1_r, optimized_p1_g, optimized_p1_b);
+    QuadrantMeans p00_means;
+    QuadrantMeans p10_means;
+    QuadrantMeans p01_means;
+    QuadrantMeans p11_means;
 
-    float4 corrected_p0_r, corrected_p0_g, corrected_p0_b;
-    float4 corrected_p1_r, corrected_p1_g, corrected_p1_b;
-    CorrectChordCurveGap(
-        optimized_p0_r, optimized_p0_g, optimized_p0_b,
-        optimized_p1_r, optimized_p1_g, optimized_p1_b,
-        corrected_p0_r, corrected_p0_g, corrected_p0_b,
-        corrected_p1_r, corrected_p1_g, corrected_p1_b);
+    ComputeParentQuadrantMeans(
+        p00.color_0,
+        p00.color_1,
+        p00_hist0,
+        p00_hist1,
+        p00_hist2,
+        p00_hist3,
+        p00_means);
 
-    SymbolicDataBC1x4 result;
-    PackAndReallocateSelectors(
-        corrected_p0_r, corrected_p0_g, corrected_p0_b,
-        corrected_p1_r, corrected_p1_g, corrected_p1_b,
-        p00_means, p10_means, p01_means, p11_means,
-        result.color_0, result.color_1, result.selectors);
-    return result;
+    ComputeParentQuadrantMeans(
+        p10.color_0,
+        p10.color_1,
+        p10_hist0,
+        p10_hist1,
+        p10_hist2,
+        p10_hist3,
+        p10_means);
+
+    ComputeParentQuadrantMeans(
+        p01.color_0,
+        p01.color_1,
+        p01_hist0,
+        p01_hist1,
+        p01_hist2,
+        p01_hist3,
+        p01_means);
+
+    ComputeParentQuadrantMeans(
+        p11.color_0,
+        p11.color_1,
+        p11_hist0,
+        p11_hist1,
+        p11_hist2,
+        p11_hist3,
+        p11_means);
+
+    return EncodeLinearBlocksBC1x4(
+        p00_means,
+        p10_means,
+        p01_means,
+        p11_means,
+        source_means);
 }
 
 #ifndef __SLANG__
 void ProcessRowBC1(
     const uint8_t *src_blocks, uint32_t src_block_width, uint32_t src_block_height,
-    uint8_t *dst_blocks, uint32_t dst_block_width, uint32_t dst_row_y);
+    uint8_t *dst_blocks, uint32_t dst_block_width, uint32_t dst_row_y, 
+    LinearBlockMean *source_block_means = nullptr);
+
+// Halves the linear block-mean image with a 2x2 box filter.
+// Repeated halving in the linear domain is algebraically identical to the
+// single s_L x s_L box mean of Theorem S (for power-of-two extents), but the
+// per-level cost decays geometrically instead of staying constant.
+void DownsampleLinearMeanRow(
+    const LinearBlockMean *src_texels,
+    uint32_t src_width,
+    uint32_t src_height,
+    LinearBlockMean *dst_texels,
+    uint32_t dst_width,
+    uint32_t dst_row_y);
+
+// Encodes one destination block row directly from the linear mean image whose
+// texel grid already matches this mip level (one mean texel == one texel).
+void ProcessLinearRowBC1(
+    const LinearBlockMean *src_texels,
+    uint32_t src_width,
+    uint32_t src_height,
+    uint8_t *dst_blocks,
+    uint32_t dst_block_width,
+    uint32_t dst_row_y);
 #endif
