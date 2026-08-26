@@ -137,7 +137,6 @@ struct ProjectionContext
     float4 mean_r, mean_g, mean_b;
 };
 
-
 struct LeastSquaresContext
 {
     float4 p0_r, p0_g, p0_b;
@@ -493,17 +492,23 @@ SHARED_INLINE void ComputeChildBlockMoments(
 
     CovarianceMatrix within;
     within.rr = (stats00.within_covariance.rr + stats10.within_covariance.rr +
-                 stats01.within_covariance.rr + stats11.within_covariance.rr) * 0.25f;
+                 stats01.within_covariance.rr + stats11.within_covariance.rr) *
+                0.25f;
     within.gg = (stats00.within_covariance.gg + stats10.within_covariance.gg +
-                 stats01.within_covariance.gg + stats11.within_covariance.gg) * 0.25f;
+                 stats01.within_covariance.gg + stats11.within_covariance.gg) *
+                0.25f;
     within.bb = (stats00.within_covariance.bb + stats10.within_covariance.bb +
-                 stats01.within_covariance.bb + stats11.within_covariance.bb) * 0.25f;
+                 stats01.within_covariance.bb + stats11.within_covariance.bb) *
+                0.25f;
     within.rg = (stats00.within_covariance.rg + stats10.within_covariance.rg +
-                 stats01.within_covariance.rg + stats11.within_covariance.rg) * 0.25f;
+                 stats01.within_covariance.rg + stats11.within_covariance.rg) *
+                0.25f;
     within.rb = (stats00.within_covariance.rb + stats10.within_covariance.rb +
-                 stats01.within_covariance.rb + stats11.within_covariance.rb) * 0.25f;
+                 stats01.within_covariance.rb + stats11.within_covariance.rb) *
+                0.25f;
     within.gb = (stats00.within_covariance.gb + stats10.within_covariance.gb +
-                 stats01.within_covariance.gb + stats11.within_covariance.gb) * 0.25f;
+                 stats01.within_covariance.gb + stats11.within_covariance.gb) *
+                0.25f;
 
     CovarianceMatrix between;
     between.rr = float4(0.0f);
@@ -821,20 +826,54 @@ SHARED_INLINE void PackAndReallocateSelectors(
     uint4 packed1 = (r1_5 << 11) | (g1_6 << 5) | b1_5;
 
 #ifndef __SLANG__
-    float4 swap_cond(
-        packed0.x < packed1.x ? -1.0f : 1.0f,
-        packed0.y < packed1.y ? -1.0f : 1.0f,
-        packed0.z < packed1.z ? -1.0f : 1.0f,
-        packed0.w < packed1.w ? -1.0f : 1.0f);
+    auto enforce_opaque_order = [](uint &color0, uint &color1)
+    {
+        if (color0 == color1)
+        {
+            // Change only one blue-channel LSB to guarantee 4-color mode.
+            if ((color1 & 0x1Fu) > 0)
+            {
+                color1 -= 1u;
+            }
+            else
+            {
+                color0 += 1u;
+            }
+        }
+        else if (color0 < color1)
+        {
+            std::swap(color0, color1);
+        }
+    };
+    enforce_opaque_order(packed0.x, packed1.x);
+    enforce_opaque_order(packed0.y, packed1.y);
+    enforce_opaque_order(packed0.z, packed1.z);
+    enforce_opaque_order(packed0.w, packed1.w);
 #else
-    float4 swap_cond = select(packed0 < packed1, float4(-1.0f), float4(1.0f));
+    bool4 equal_endpoints = packed0 == packed1;
+    bool4 can_decrease_blue =
+        (packed1 & uint4(0x1Fu)) > uint4(0u);
+
+    // If blue is nonzero, lower color1 by one blue LSB.
+    packed1 = select(
+        equal_endpoints && can_decrease_blue,
+        packed1 - uint4(1u),
+        packed1);
+
+    // Otherwise raise color0 by one blue LSB.
+    packed0 = select(
+        equal_endpoints && !can_decrease_blue,
+        packed0 + uint4(1u),
+        packed0);
+
+    bool4 swap_endpoints = packed0 < packed1;
+    uint4 unswapped0 = packed0;
+    packed0 = select(swap_endpoints, packed1, packed0);
+    packed1 = select(swap_endpoints, unswapped0, packed1);
 #endif
 
-    uint4 adjusted_packed0 = SelectLtZeroUint(swap_cond, packed1, packed0);
-    uint4 adjusted_packed1 = SelectLtZeroUint(swap_cond, packed0, packed1);
-
-    out_color0 = adjusted_packed0;
-    out_color1 = adjusted_packed1;
+    out_color0 = packed0;
+    out_color1 = packed1;
 
     // Rebuild the quantized hardware palette before selector assignment.
     LinearPaletteBC1 palette = BuildOpaqueLinearPaletteBC1(out_color0, out_color1);
