@@ -32,28 +32,48 @@ bool DdsLoader::Load(const std::string &file_path)
     width_ = header.width;
     height_ = header.height;
     mip_map_count_ = header.mip_map_count;
+    format_ = TextureFormat::kUnknown;
 
-    bool is_bc1 = false;
     if (header.ddspf.flags & 0x00000004)
     {
         if (header.ddspf.four_cc == MAKE_FOUR_CC('D', 'X', 'T', '1'))
         {
-            is_bc1 = true;
+            format_ = TextureFormat::kBc1;
         }
         else if (header.ddspf.four_cc == MAKE_FOUR_CC('D', 'X', '1', '0'))
         {
             DdsHeaderDxt10 header_dx10;
             file.read(reinterpret_cast<char *>(&header_dx10), sizeof(DdsHeaderDxt10));
-            if (header_dx10.dxgi_format == 71 || header_dx10.dxgi_format == 72)
+
+            switch (header_dx10.dxgi_format)
             {
-                is_bc1 = true;
+            case 71:
+            case 72:
+                format_ = TextureFormat::kBc1;
+                break;
+            case 77:
+            case 78:
+                format_ = TextureFormat::kBc3;
+                break;
+            case 80:
+            case 81:
+                format_ = TextureFormat::kBc4;
+                break;
+            case 83:
+            case 84:
+                format_ = TextureFormat::kBc5;
+                break;
+            case 98:
+            case 99:
+                format_ = TextureFormat::kBc7;
+                break;
             }
         }
     }
 
-    if (!is_bc1)
+    if (format_ == TextureFormat::kUnknown)
     {
-        std::cerr << "[DdsLoader] Currently only BC1 format is supported.\n";
+        std::cerr << "[DdsLoader] Unsupported or unknown DDS format (BC6H is explicitly excluded).\n";
         return false;
     }
 
@@ -65,13 +85,14 @@ bool DdsLoader::Load(const std::string &file_path)
     auto data_size = file_size - current_pos;
     if (data_size > 0)
     {
-        size_t block_count = static_cast<size_t>(data_size) / sizeof(Bc1Block);
-        bc1_blocks_.resize(block_count);
-        file.read(reinterpret_cast<char *>(bc1_blocks_.data()), data_size);
+        raw_blocks_.resize(static_cast<size_t>(data_size));
+        file.read(reinterpret_cast<char *>(raw_blocks_.data()), data_size);
     }
 
-    std::cout << "[DdsLoader] Loaded BC1. Size: " << width_ << "x" << height_
-              << ", Blocks: " << bc1_blocks_.size() << "\n";
+    uint32_t block_size = GetBlockSize(format_);
+    std::cout << "[DdsLoader] Loaded Format: " << static_cast<int>(format_)
+              << ", Size: " << width_ << "x" << height_
+              << ", Blocks: " << raw_blocks_.size() / block_size << "\n";
 
     return true;
 }

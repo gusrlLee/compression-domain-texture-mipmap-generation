@@ -1,12 +1,10 @@
-#ifndef __DDS_LOADER_HEADER__
-#define __DDS_LOADER_HEADER__
+#pragma once
 
-#include <stdint.h>
-#include <filesystem>
-#include <vector>
+#include <cstdint>
 #include <string>
+#include <vector>
 
-#include "type.h"
+#include "types.h"
 
 class DdsLoader
 {
@@ -19,15 +17,15 @@ public:
     uint32_t width() const { return width_; }
     uint32_t height() const { return height_; }
     uint32_t mip_map_count() const { return mip_map_count_; }
+    TextureFormat format() const { return format_; }
 
-    const std::vector<Bc1Block> &bc1_blocks() const { return bc1_blocks_; }
+    const std::vector<uint8_t> &raw_blocks() const { return raw_blocks_; }
 
 private:
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     uint32_t mip_map_count_ = 0;
+    TextureFormat format_ = TextureFormat::kUnknown;
 
-    std::vector<Bc1Block> bc1_blocks_;
+    std::vector<uint8_t> raw_blocks_;
 };
-
-#endif // __DDS_LOADER_HEADER__

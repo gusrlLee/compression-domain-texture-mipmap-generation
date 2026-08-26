@@ -26,15 +26,31 @@ find_library(
 add_executable(
     ${PROJECT_NAME} 
     src/main.cpp
-    src/type.h
+    src/types.h
     src/dds_loader.h
     src/dds_loader.cpp
+    src/dds_writer.h
+    src/dds_writer.cpp
+    src/png_writer.h
+    src/png_writer.cpp
+    src/lodepng.h
+    src/lodepng.cpp
+    src/mipmap_layout.h
+    src/mipmap_layout.cpp
+    src/backend.h
+    src/backend_cpu.h
+    src/backend_cpu.cpp
+    src/task_dispatch.h
+    src/task_dispatch.cpp
+
+    src/codec/bc1.h
+    src/codec/bc1.cpp
 )
 
 target_include_directories(
     ${PROJECT_NAME}
     PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        ${CMAKE_SOURCE_DIR}/src
 )
 
 target_link_libraries(
